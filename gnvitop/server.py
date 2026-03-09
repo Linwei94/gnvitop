@@ -2,6 +2,7 @@
 """GPU Monitor - Flask server that reads SSH config and queries remote GPUs."""
 
 import getpass
+import logging
 import os
 import re
 import subprocess
@@ -12,6 +13,9 @@ import socket
 
 from flask import Flask, jsonify, Response
 import paramiko
+
+# Suppress paramiko's internal exception tracebacks printed to stderr
+logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 
 from . import __version__
 from .dashboard import DASHBOARD_HTML
@@ -49,6 +53,9 @@ SYSTEM_USERS = frozenset({
 cache = {"data": [], "last_update": 0}
 cache_lock = threading.Lock()
 CACHE_TTL = 30
+
+# Limit concurrent SSH connections to avoid triggering server MaxStartups
+SSH_SEMAPHORE = threading.Semaphore(3)
 
 
 def parse_ssh_config(path):
@@ -113,103 +120,104 @@ def query_gpu(host_info):
         "gpus": [],
     }
 
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    with SSH_SEMAPHORE:
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        connect_kwargs = {
-            "hostname": hostname,
-            "port": port,
-            "username": user,
-            "timeout": SSH_TIMEOUT,
-            "banner_timeout": SSH_TIMEOUT,
-            "auth_timeout": SSH_TIMEOUT,
-            "allow_agent": True,
-            "look_for_keys": True,
-        }
-        if host_info.get("identity_file"):
-            connect_kwargs["key_filename"] = host_info["identity_file"]
+            connect_kwargs = {
+                "hostname": hostname,
+                "port": port,
+                "username": user,
+                "timeout": SSH_TIMEOUT,
+                "banner_timeout": SSH_TIMEOUT,
+                "auth_timeout": SSH_TIMEOUT,
+                "allow_agent": True,
+                "look_for_keys": True,
+            }
+            if host_info.get("identity_file"):
+                connect_kwargs["key_filename"] = host_info["identity_file"]
 
-        # Retry on SSH banner errors (e.g. server MaxStartups limit hit)
-        last_banner_error = None
-        for attempt in range(SSH_BANNER_RETRIES):
-            if attempt > 0:
-                time.sleep(SSH_BANNER_RETRY_DELAY * attempt)
-            try:
-                client.connect(**connect_kwargs)
-                last_banner_error = None
-                break
-            except paramiko.SSHException as e:
-                if "banner" in str(e).lower() and attempt < SSH_BANNER_RETRIES - 1:
-                    last_banner_error = e
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
-                    client = paramiko.SSHClient()
-                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    continue
-                raise
-        if last_banner_error is not None:
-            raise last_banner_error
+            # Retry on SSH banner errors (e.g. server MaxStartups limit hit)
+            last_banner_error = None
+            for attempt in range(SSH_BANNER_RETRIES):
+                if attempt > 0:
+                    time.sleep(SSH_BANNER_RETRY_DELAY * attempt)
+                try:
+                    client.connect(**connect_kwargs)
+                    last_banner_error = None
+                    break
+                except paramiko.SSHException as e:
+                    if "banner" in str(e).lower() and attempt < SSH_BANNER_RETRIES - 1:
+                        last_banner_error = e
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                        client = paramiko.SSHClient()
+                        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                        continue
+                    raise
+            if last_banner_error is not None:
+                raise last_banner_error
 
-        stdin, stdout, stderr = client.exec_command(GPU_QUERY_CMD, timeout=SSH_TIMEOUT)
-        output = stdout.read().decode("utf-8").strip()
+            stdin, stdout, stderr = client.exec_command(GPU_QUERY_CMD, timeout=SSH_TIMEOUT)
+            output = stdout.read().decode("utf-8").strip()
 
-        if not output:
-            result["status"] = "no_gpu"
-            result["error"] = "No NVIDIA GPU found or nvidia-smi not available"
-        else:
-            gpus = []
-            for line in output.split("\n"):
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 7:
-                    mem_total = float(parts[2])
-                    mem_used = float(parts[3])
-                    mem_free = float(parts[4])
-                    utilization = float(parts[5])
-                    gpus.append({
-                        "index": int(parts[0]),
-                        "name": parts[1],
-                        "memory_total_mb": mem_total,
-                        "memory_used_mb": mem_used,
-                        "memory_free_mb": mem_free,
-                        "memory_usage_pct": round(mem_used / mem_total * 100, 1) if mem_total > 0 else 0,
-                        "gpu_utilization_pct": utilization,
-                        "temperature_c": float(parts[6]),
-                        "processes": [],
-                    })
-
-            # Query per-GPU processes with usernames
-            try:
-                _, p_stdout, _ = client.exec_command(
-                    PROCESS_WITH_USER_CMD, timeout=SSH_TIMEOUT
-                )
-                proc_output = p_stdout.read().decode("utf-8").strip()
-                if proc_output:
-                    _attach_processes(gpus, proc_output)
-            except Exception:
-                pass  # process info is best-effort
-
-            result["gpus"] = gpus
-            if gpus:
-                result["status"] = "ok"
-            else:
+            if not output:
                 result["status"] = "no_gpu"
-                result["error"] = "nvidia-smi returned no valid GPU data"
+                result["error"] = "No NVIDIA GPU found or nvidia-smi not available"
+            else:
+                gpus = []
+                for line in output.split("\n"):
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 7:
+                        mem_total = float(parts[2])
+                        mem_used = float(parts[3])
+                        mem_free = float(parts[4])
+                        utilization = float(parts[5])
+                        gpus.append({
+                            "index": int(parts[0]),
+                            "name": parts[1],
+                            "memory_total_mb": mem_total,
+                            "memory_used_mb": mem_used,
+                            "memory_free_mb": mem_free,
+                            "memory_usage_pct": round(mem_used / mem_total * 100, 1) if mem_total > 0 else 0,
+                            "gpu_utilization_pct": utilization,
+                            "temperature_c": float(parts[6]),
+                            "processes": [],
+                        })
 
-        client.close()
+                # Query per-GPU processes with usernames
+                try:
+                    _, p_stdout, _ = client.exec_command(
+                        PROCESS_WITH_USER_CMD, timeout=SSH_TIMEOUT
+                    )
+                    proc_output = p_stdout.read().decode("utf-8").strip()
+                    if proc_output:
+                        _attach_processes(gpus, proc_output)
+                except Exception:
+                    pass  # process info is best-effort
 
-    except paramiko.AuthenticationException:
-        result["error"] = "Authentication failed"
-    except paramiko.SSHException as e:
-        result["error"] = f"SSH error: {e}"
-    except TimeoutError:
-        result["error"] = "Connection timed out"
-    except OSError as e:
-        result["error"] = f"Connection failed: {e}"
-    except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
+                result["gpus"] = gpus
+                if gpus:
+                    result["status"] = "ok"
+                else:
+                    result["status"] = "no_gpu"
+                    result["error"] = "nvidia-smi returned no valid GPU data"
+
+            client.close()
+
+        except paramiko.AuthenticationException:
+            result["error"] = "Authentication failed"
+        except paramiko.SSHException as e:
+            result["error"] = f"SSH error: {e}"
+        except TimeoutError:
+            result["error"] = "Connection timed out"
+        except OSError as e:
+            result["error"] = f"Connection failed: {e}"
+        except Exception as e:
+            result["error"] = f"{type(e).__name__}: {e}"
 
     return result
 
