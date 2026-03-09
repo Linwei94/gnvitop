@@ -8,6 +8,7 @@ import subprocess
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import socket
 
 from flask import Flask, jsonify, Response
 import paramiko
@@ -19,6 +20,8 @@ app = Flask(__name__)
 
 SSH_CONFIG_PATH = os.path.expanduser("~/.ssh/config")
 SSH_TIMEOUT = 8
+SSH_BANNER_RETRIES = 3
+SSH_BANNER_RETRY_DELAY = 2  # seconds
 GPU_QUERY_CMD = (
     "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,"
     "utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null"
@@ -127,7 +130,28 @@ def query_gpu(host_info):
         if host_info.get("identity_file"):
             connect_kwargs["key_filename"] = host_info["identity_file"]
 
-        client.connect(**connect_kwargs)
+        # Retry on SSH banner errors (e.g. server MaxStartups limit hit)
+        last_banner_error = None
+        for attempt in range(SSH_BANNER_RETRIES):
+            if attempt > 0:
+                time.sleep(SSH_BANNER_RETRY_DELAY * attempt)
+            try:
+                client.connect(**connect_kwargs)
+                last_banner_error = None
+                break
+            except paramiko.SSHException as e:
+                if "banner" in str(e).lower() and attempt < SSH_BANNER_RETRIES - 1:
+                    last_banner_error = e
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = paramiko.SSHClient()
+                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    continue
+                raise
+        if last_banner_error is not None:
+            raise last_banner_error
 
         stdin, stdout, stderr = client.exec_command(GPU_QUERY_CMD, timeout=SSH_TIMEOUT)
         output = stdout.read().decode("utf-8").strip()
@@ -211,8 +235,6 @@ def _attach_processes(gpus, proc_output):
 
 def query_local_gpu():
     """Query the local machine for GPU information."""
-    import socket
-
     hostname = socket.gethostname()
     result = {
         "alias": "localhost",
