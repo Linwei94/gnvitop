@@ -126,13 +126,14 @@ def _draw(stdscr, data, loading, last_update, next_refresh, refresh_interval):
                 mem_pct = gpu["memory_usage_pct"]
                 gpu_pct = gpu["gpu_utilization_pct"]
                 temp    = gpu["temperature_c"]
+                # Negative sentinel values mean "unknown" (e.g. TPUs, or GPUs
+                # reporting [N/A] for a metric); show N/A instead of a bar.
+                mem_known  = mem_pct >= 0
+                gpu_known  = gpu_pct >= 0
+                temp_known = temp >= 0
                 mem_used  = _fmt_mb(gpu["memory_used_mb"])
                 mem_total = _fmt_mb(gpu["memory_total_mb"])
                 gpu_name  = gpu["name"]
-
-                mem_cp  = _usage_pair(mem_pct)
-                gpu_cp  = _usage_pair(gpu_pct)
-                temp_cp = _temp_pair(temp)
 
                 col = 0
                 prefix = f"    GPU{gpu['index']} {gpu_name[:16]:<16} "
@@ -142,24 +143,39 @@ def _draw(stdscr, data, loading, last_update, next_refresh, refresh_interval):
                 # Memory bar
                 _safe_addstr(stdscr, row, col, "MEM ", WHITE)
                 col += 4
-                _safe_addstr(stdscr, row, col, _bar(mem_pct, bar_w), curses.color_pair(mem_cp))
-                col += bar_w
-                mem_str = f" {mem_used}/{mem_total} "
-                _safe_addstr(stdscr, row, col, mem_str, WHITE)
-                col += len(mem_str)
+                if mem_known:
+                    _safe_addstr(stdscr, row, col, _bar(mem_pct, bar_w),
+                                 curses.color_pair(_usage_pair(mem_pct)))
+                    col += bar_w
+                    mem_str = f" {mem_used}/{mem_total} "
+                    _safe_addstr(stdscr, row, col, mem_str, WHITE)
+                    col += len(mem_str)
+                else:
+                    _safe_addstr(stdscr, row, col, "N/A".ljust(bar_w), YELLOW)
+                    col += bar_w
 
                 # GPU utilization bar
                 _safe_addstr(stdscr, row, col, "GPU ", WHITE)
                 col += 4
-                _safe_addstr(stdscr, row, col, _bar(gpu_pct, bar_w), curses.color_pair(gpu_cp))
-                col += bar_w
-                gpu_str = f" {gpu_pct:3.0f}% "
-                _safe_addstr(stdscr, row, col, gpu_str, curses.color_pair(gpu_cp))
-                col += len(gpu_str)
+                if gpu_known:
+                    _safe_addstr(stdscr, row, col, _bar(gpu_pct, bar_w),
+                                 curses.color_pair(_usage_pair(gpu_pct)))
+                    col += bar_w
+                    gpu_str = f" {gpu_pct:3.0f}% "
+                    _safe_addstr(stdscr, row, col, gpu_str,
+                                 curses.color_pair(_usage_pair(gpu_pct)))
+                    col += len(gpu_str)
+                else:
+                    _safe_addstr(stdscr, row, col, "N/A".ljust(bar_w), YELLOW)
+                    col += bar_w
 
                 # Temperature
-                temp_str = f"{int(temp)}\u00b0C"
-                _safe_addstr(stdscr, row, col, temp_str, curses.color_pair(temp_cp))
+                if temp_known:
+                    temp_str = f"{int(temp)}\u00b0C"
+                    _safe_addstr(stdscr, row, col, temp_str,
+                                 curses.color_pair(_temp_pair(temp)))
+                else:
+                    _safe_addstr(stdscr, row, col, "N/A", YELLOW)
 
                 row += 1
 
