@@ -60,15 +60,25 @@ _MX_PROC_QUERY = (
     r" fi; done"
 )
 
+# ── System memory query ──────────────────────────────────────────────────────
+# Unified-memory GPUs (e.g. NVIDIA GB10 / DGX Spark) report [N/A] for all
+# nvidia-smi memory fields; emit MemTotal + used (MemTotal - MemAvailable) in
+# MiB so the parser can fall back to the unified system pool.
+_SYS_MEM_QUERY = (
+    "echo '---SYS---'"
+    "; awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2}"
+    " END{printf \"%d %d\", int(t/1024), int((t-a)/1024)}' /proc/meminfo"
+)
+
 # ── Auto-detect: try nvidia-smi first, fall back to mx-smi ───────────────────
 # Output begins with "NVIDIA\n" or "MX\n" so the parser knows which format follows
 COMBINED_CMD = (
     "if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then "
-    "echo NVIDIA; " + _GPU_QUERY + "; echo '---SEP---'; " + _PROC_QUERY + "; "
+    "echo NVIDIA; " + _GPU_QUERY + "; echo '---SEP---'; " + _PROC_QUERY + "; " + _SYS_MEM_QUERY + "; "
     "elif command -v mx-smi >/dev/null 2>&1; then "
-    "echo MX; mx-smi 2>/dev/null; echo '---SEP---'; " + _MX_PROC_QUERY + "; "
+    "echo MX; mx-smi 2>/dev/null; echo '---SEP---'; " + _MX_PROC_QUERY + "; " + _SYS_MEM_QUERY + "; "
     "elif ls /dev/accel0 >/dev/null 2>&1; then "
-    "echo TPU; " + _TPU_CHIP_QUERY + "; echo '---SEP---'; " + _TPU_PROC_QUERY + "; "
+    "echo TPU; " + _TPU_CHIP_QUERY + "; echo '---SEP---'; " + _TPU_PROC_QUERY + "; " + _SYS_MEM_QUERY + "; "
     "fi"
 )
 
@@ -142,7 +152,7 @@ def parse_ssh_config(path):
 
 
 def _parse_combined_output(output):
-    """Split combined command output into (gpu_part, proc_part, vendor).
+    """Split combined command output into (gpu_part, proc_part, sys_part, vendor).
 
     Output may begin with 'NVIDIA', 'MX', or 'TPU' to indicate accelerator vendor.
     Returns vendor as one of: 'nvidia', 'mx', 'tpu'.
@@ -158,34 +168,77 @@ def _parse_combined_output(output):
         vendor = "tpu"
         output = "\n".join(lines[1:])
 
+    sys_part = ""
+    if "---SYS---" in output:
+        output, sys_part = output.split("---SYS---", 1)
     if "---SEP---" in output:
         gpu_part, proc_part = output.split("---SEP---", 1)
     else:
         gpu_part, proc_part = output, ""
-    return gpu_part.strip(), proc_part.strip(), vendor
+    return gpu_part.strip(), proc_part.strip(), sys_part.strip(), vendor
 
 
-def _build_gpus(gpu_part):
-    """Parse GPU stats section into a list of GPU dicts."""
+def _safe_float(value, default=-1.0):
+    """Parse a numeric CSV field, tolerating nvidia-smi's N/A placeholders.
+
+    Returns default (a negative sentinel meaning 'unknown') when the field is
+    empty, '[N/A]', '[Not Supported]', '-', or otherwise not a number.
+    """
+    v = value.strip().lower()
+    if not v or v in ("n/a", "[n/a]", "na", "[not supported]", "[unknown]", "-", "--"):
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        return default
+
+
+def _parse_sys_mem(sys_part):
+    """Parse the '---SYS---' section into (total_mb, used_mb) or None."""
+    try:
+        vals = sys_part.split()
+        if len(vals) >= 2 and float(vals[0]) > 0:
+            return float(vals[0]), float(vals[1])
+    except ValueError:
+        pass
+    return None
+
+
+def _build_gpus(gpu_part, sys_mem_mb=None):
+    """Parse GPU stats section into a list of GPU dicts.
+
+    Unified-memory GPUs (GB10 / DGX Spark) report [N/A] for every memory field;
+    when that happens, use the system memory figures passed in sys_mem_mb as the
+    unified pool. Genuinely unknown values are -1 sentinels (same as TPU).
+    """
     gpus = []
     for line in gpu_part.split("\n"):
         if not line.strip():
             continue
         parts = [p.strip() for p in line.split(",")]
         if len(parts) >= 7:
-            mem_total = float(parts[2])
-            mem_used = float(parts[3])
-            mem_free = float(parts[4])
-            utilization = float(parts[5])
+            mem_total = _safe_float(parts[2])
+            mem_used = _safe_float(parts[3])
+            mem_free = _safe_float(parts[4])
+            utilization = _safe_float(parts[5])
+            if mem_total < 0 and sys_mem_mb is not None:
+                sys_total, sys_used = sys_mem_mb
+                mem_total = sys_total
+                mem_used = sys_used if sys_used >= 0 else -1
+                mem_free = mem_total - mem_used if mem_used >= 0 else -1
+            if mem_total > 0 and mem_used >= 0:
+                mem_pct = round(mem_used / mem_total * 100, 1)
+            else:
+                mem_pct = -1
             gpus.append({
                 "index": int(parts[0]),
                 "name": parts[1],
                 "memory_total_mb": mem_total,
                 "memory_used_mb": mem_used,
                 "memory_free_mb": mem_free,
-                "memory_usage_pct": round(mem_used / mem_total * 100, 1) if mem_total > 0 else 0,
+                "memory_usage_pct": mem_pct,
                 "gpu_utilization_pct": utilization,
-                "temperature_c": float(parts[6]),
+                "temperature_c": _safe_float(parts[6]),
                 "processes": [],
             })
     return gpus
@@ -215,17 +268,17 @@ def _build_mx_gpus(output):
         if m1 and i + 1 < len(lines):
             m2 = row2_re.search(lines[i + 1])
             if m2:
-                mem_used = float(m2.group(2))
-                mem_total = float(m2.group(3))
+                mem_used = _safe_float(m2.group(2))
+                mem_total = _safe_float(m2.group(3))
                 gpus.append({
                     "index": int(m1.group(1)),
                     "name": m1.group(2).strip(),
                     "memory_total_mb": mem_total,
                     "memory_used_mb": mem_used,
-                    "memory_free_mb": mem_total - mem_used,
-                    "memory_usage_pct": round(mem_used / mem_total * 100, 1) if mem_total > 0 else 0,
-                    "gpu_utilization_pct": float(m1.group(3)),
-                    "temperature_c": float(m2.group(1)),
+                    "memory_free_mb": mem_total - mem_used if mem_total >= 0 and mem_used >= 0 else -1,
+                    "memory_usage_pct": round(mem_used / mem_total * 100, 1) if mem_total > 0 and mem_used >= 0 else -1,
+                    "gpu_utilization_pct": _safe_float(m1.group(3)),
+                    "temperature_c": _safe_float(m2.group(1)),
                     "processes": [],
                 })
                 i += 2
@@ -246,7 +299,7 @@ def _attach_mx_processes(gpus, proc_output):
             gpu_idx = int(parts[0])
             proc = {
                 "pid": int(parts[1]),
-                "gpu_memory_mb": float(parts[2]) if parts[2] else 0,
+                "gpu_memory_mb": _safe_float(parts[2], default=0.0),
                 "user": user,
                 "command": "",
             }
@@ -390,7 +443,8 @@ def query_gpu(host_info, hosts_by_alias=None):
         output = stdout.read().decode("utf-8").strip()
         client.close()
 
-        gpu_part, proc_part, vendor = _parse_combined_output(output)
+        gpu_part, proc_part, sys_part, vendor = _parse_combined_output(output)
+        sys_mem = _parse_sys_mem(sys_part)
 
         if not gpu_part:
             result["status"] = "no_gpu"
@@ -406,7 +460,7 @@ def query_gpu(host_info, hosts_by_alias=None):
                     _attach_tpu_processes(gpus, proc_part)
                 result["is_tpu"] = True
             else:
-                gpus = _build_gpus(gpu_part)
+                gpus = _build_gpus(gpu_part, sys_mem)
                 if proc_part:
                     _attach_processes(gpus, proc_part)
             result["gpus"] = gpus
@@ -448,7 +502,7 @@ def _attach_processes(gpus, proc_output):
             gpu_idx = int(parts[1])
             proc = {
                 "pid": int(parts[0]),
-                "gpu_memory_mb": float(parts[2]) if parts[2] else 0,
+                "gpu_memory_mb": _safe_float(parts[2], default=0.0),
                 "user": user,
                 "command": parts[4] if len(parts) >= 5 else "",
             }
@@ -477,7 +531,8 @@ def query_local_gpu():
             COMBINED_CMD, shell=True, capture_output=True, text=True, timeout=30
         ).stdout.strip()
 
-        gpu_part, proc_part, vendor = _parse_combined_output(output)
+        gpu_part, proc_part, sys_part, vendor = _parse_combined_output(output)
+        sys_mem = _parse_sys_mem(sys_part)
 
         if not gpu_part:
             result["status"] = "no_gpu"
@@ -493,7 +548,7 @@ def query_local_gpu():
                     _attach_tpu_processes(gpus, proc_part)
                 result["is_tpu"] = True
             else:
-                gpus = _build_gpus(gpu_part)
+                gpus = _build_gpus(gpu_part, sys_mem)
                 if proc_part:
                     _attach_processes(gpus, proc_part)
             result["gpus"] = gpus
